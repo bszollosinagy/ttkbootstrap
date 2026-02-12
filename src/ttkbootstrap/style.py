@@ -1,19 +1,72 @@
+"""Style engine and theme management for ttkbootstrap.
+
+This module provides the core styling system for ttkbootstrap, managing themes,
+colors, and widget styles. It includes the Style class for applying and managing
+Bootstrap-inspired themes, along with color manipulation utilities.
+
+Classes:
+    Colors: Defines color scheme for themes with manipulation methods
+    ThemeDefinition: Encapsulates complete theme configuration
+    Style: Main style engine for managing themes and widget styles
+    StylerTTK: TTK widget styler
+    StylerTK: Legacy tk widget styler
+    Bootstyle: API for applying bootstyles to widgets
+
+Key Features:
+    - 40+ built-in Bootstrap-inspired themes
+    - Dynamic theme switching at runtime
+    - Custom theme creation and management
+    - Widget-specific style boosting (outline, link, toggle, etc.)
+    - Color utilities for HSV manipulation
+    - Publisher-subscriber pattern for theme change notifications
+    - Support for user-defined themes
+
+Color Keywords:
+    - primary, secondary, success, info, warning, danger, light, dark
+
+Style Types:
+    - outline, link, toggle, inverse, striped, toolbutton, square
+
+Example:
+    ```python
+    import ttkbootstrap as ttk
+    from ttkbootstrap.constants import *
+
+    # Create window with theme
+    app = ttk.Window(themename="darkly")
+
+    # Access style instance
+    style = ttk.Style.get_instance()
+
+    # Get theme colors
+    primary_color = style.colors.primary
+    bg_color = style.colors.bg
+
+    # Change theme at runtime
+    style.theme_use("flatly")
+
+    # Create styled widgets
+    btn = ttk.Button(app, text="Success", bootstyle="success")
+    btn_outline = ttk.Button(app, text="Danger", bootstyle="danger-outline")
+
+    app.mainloop()
+    ```
+"""
+import colorsys
 import json
 import re
-import colorsys
 import tkinter as tk
-from tkinter import font
 from math import ceil
-from tkinter import TclError, ttk
+from tkinter import TclError, font, ttk
 from typing import Any, Callable
-from PIL import ImageTk, ImageDraw, Image, ImageFont
-from ttkbootstrap.constants import *
-from ttkbootstrap.themes.standard import STANDARD_THEMES
-from ttkbootstrap.publisher import Publisher, Channel
-from ttkbootstrap import utility as util
-from ttkbootstrap import colorutils
-from PIL import ImageColor
 
+from PIL import Image, ImageColor, ImageDraw, ImageFont, ImageTk
+from PIL.Image import Resampling, Transpose
+
+from ttkbootstrap import colorutils, utility as util
+from ttkbootstrap.constants import *
+from ttkbootstrap.publisher import Channel, Publisher
+from ttkbootstrap.themes.standard import STANDARD_THEMES
 
 try:
     # prevent app from failing if user.py gets corrupted
@@ -190,7 +243,7 @@ class Colors:
         bg = ImageColor.getrgb(background)
         rgb_float = [alpha * c1 + (1 - alpha) * c2 for (c1, c2) in zip(fg, bg)]
         rgb_int = [int(x) for x in rgb_float]
-        return '#{:02x}{:02x}{:02x}'.format(*rgb_int)    
+        return '#{:02x}{:02x}{:02x}'.format(*rgb_int)
 
     @staticmethod
     def rgb_to_hsv(r, g, b):
@@ -205,25 +258,88 @@ class Colors:
                 blue
 
         Returns:
-            Tuple[float, float, float]: The hsv color value.
+            tuple[float, float, float]: The hsv color value.
         """
         return colorsys.rgb_to_hsv(r, g, b)
+
+    def get_luminance(self, color):
+        """Calculate the luminance of a color.
+
+        Parameters:
+            color (str):
+                A hexadecimal color value.
+        Returns:
+            float:
+                The luminance value of the color.
+        """
+        r, g, b = self.hex_to_rgb(color)
+
+        # Convert RGB to linear RGB
+        r = self._get_luminance_value(r)
+        g = self._get_luminance_value(g)
+        b = self._get_luminance_value(b)
+
+        # Calculate luminance using the WCAG formula
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+    def _get_luminance_value(self, value):
+        if value <= 0.03928:
+            return value / 12.92
+        else:
+            return ((value + 0.055) / 1.055) ** 2.4
+
+    def get_contrast_ration(self, lum1, lum2):
+        """Calculate the contrast ratio between two luminance values.
+
+        Parameters:
+            lum1 (float):
+                The first luminance value.
+            lum2 (float):
+                The second luminance value.
+
+        Returns:
+            float:
+                The contrast ratio.
+        """
+        if lum1 > lum2:
+            return (lum1 + 0.05) / (lum2 + 0.05)
+        else:
+            return (lum2 + 0.05) / (lum1 + 0.05)
 
     def get_foreground(self, color_label):
         """Return the appropriate foreground color for the specified
         color_label.
 
         Parameters:
-
             color_label (str):
                 A color label corresponding to a class property
+
+        Returns:
+            str:
+                A hexadecimal color value for the foreground color.
+
+        Raises:
+            TypeError: If the color_label is not a valid color property.
         """
         if color_label == LIGHT:
             return self.dark
         elif color_label == DARK:
             return self.light
-        else:
+
+        if not Style().dynamic_foreground:
             return self.selectfg
+
+        # dynamic foreground selection
+        contrast_with_fg = self.get_contrast_ration(
+            self.get_luminance(self.get(color_label)), self.get_luminance(self.fg)
+        )
+        contrast_with_selectfg = self.get_contrast_ration(
+            self.get_luminance(self.get(color_label)), self.get_luminance(self.selectfg)
+        )
+
+        if contrast_with_fg > contrast_with_selectfg:
+            return self.fg
+        return self.selectfg
 
     def get(self, color_label: str):
         """Lookup a color value from the color name
@@ -319,7 +435,7 @@ class Colors:
                 An rgb color value.
         """
         r, g, b = colorutils.color_to_rgb(color)
-        return r/255, g/255, b/255
+        return r / 255, g / 255, b / 255
 
     @staticmethod
     def rgb_to_hex(r: int, g: int, b: int):
@@ -402,8 +518,14 @@ class Colors:
 
 
 class ThemeDefinition:
-    """A class to provide defined name, colors, and font settings for a
-    ttkbootstrap theme."""
+    """Encapsulates the name, color palette, and metadata for a
+    ttkbootstrap theme.
+
+    A ThemeDefinition is a lightweight container that pairs a theme name
+    with its Colors object and whether it is a light or dark theme. The
+    Style engine consumes ThemeDefinition instances to build widget
+    styles and images for the active theme.
+    """
 
     def __init__(self, name, colors, themetype=LIGHT):
         """
@@ -412,18 +534,17 @@ class ThemeDefinition:
             name (str):
                 The name of the theme.
 
-            colors (Colors):
-                An object that defines the color scheme for a theme.
+            colors (Colors or dict):
+                A Colors instance or a dict of color values.
 
             themetype (str):
                 Specifies whether the theme is **light** or **dark**.
         """
         self.name = name
-        self.colors = Colors(**colors)
+        self.colors = colors if isinstance(colors, Colors) else Colors(**colors)
         self.type = themetype
 
     def __repr__(self):
-
         return " ".join(
             [
                 f"name={self.name},",
@@ -485,6 +606,7 @@ class Style(ttk.Style):
         self._theme_styles = {}  # styles used in theme
         self._theme_names = set()
         self._load_themes()
+        self._dynamic_foreground = False
         super().__init__()
 
         Style.instance = self
@@ -537,7 +659,7 @@ class Style(ttk.Style):
 
         Returns:
 
-            List[str, ...]:
+            list[str, ...]:
                 A list of theme names.
         """
         return list(self._theme_definitions.keys())
@@ -600,6 +722,60 @@ class Style(ttk.Style):
         else:
             raise TclError(themename, "is not a valid theme.")
 
+    def theme_create(self, themename: str, parent: str = None, settings: dict = None) -> None:
+        """
+        Create a new theme in the Tcl interpreter. If the parent is a registered
+        ttkbootstrap theme, the new theme will be registered with a copied
+        ThemeDefinition and builder. Duplicate registration is avoided.
+
+        Parameters:
+
+            themename (str):
+                The name of the new theme.
+
+            parent (str):
+                The name of the parent theme to inherit from.
+
+            settings (dict):
+                A dictionary of style settings (Tcl-style).
+        """
+        from tkinter.ttk import _script_from_settings  # type: ignore[attr-defined]
+
+        script = _script_from_settings(settings) if settings else ''
+
+        # Lazy-load parent if it's a known bootstrap theme
+        if parent:
+            if parent not in super().theme_names():
+                if parent in self._theme_names:
+                    self.theme_use(parent)
+                else:
+                    raise TclError(f"{parent!r} is not a valid theme name or parent theme.")
+
+        # Create the Tcl-level theme
+        if parent:
+            self.tk.call(
+                self._name, "theme", "create", themename,
+                "-parent", parent, "-settings", script)
+        else:
+            self.tk.call(
+                self._name, "theme", "create", themename,
+                "-settings", script)
+
+        # Register the new theme if copying from a ttkbootstrap theme
+        if parent in self._theme_definitions and themename not in self._theme_definitions:
+            parent_def = self._theme_definitions[parent]
+            copied_def = ThemeDefinition(
+                name=themename,
+                colors=parent_def.colors,
+                themetype=parent_def.type
+            )
+            self._theme_definitions[themename] = copied_def
+            self._theme_names.add(themename)
+            self._theme_styles[themename] = set()
+
+            if themename not in self._theme_objects:
+                self._theme_objects[themename] = StyleBuilderTTK(build=False)
+
     def style_exists_in_theme(self, ttkstyle: str):
         """Check if a style exists in the current theme.
 
@@ -613,10 +789,39 @@ class Style(ttk.Style):
             bool:
                 `True` if the style exists, otherwise `False`.
         """
+        if self.theme is None:
+            return False
+
         theme_styles = self._theme_styles.get(self.theme.name)
+        if theme_styles is None:
+            return False
+
         exists_in_theme = ttkstyle in theme_styles
         exists_in_registry = ttkstyle in self._style_registry
         return exists_in_theme and exists_in_registry
+
+    def use_dynamic_foreground(self, enable: bool = True):
+        """Enable or disable dynamic foreground color selection.
+
+        When enabled, the foreground color of widgets will be decided
+        between the `fg` and `selectfg` colors based on the
+        contrast ratio with the widget's background color.
+        At default, this is disabled.
+
+        Parameters:
+
+            enable (bool):
+                If `True`, dynamic foreground selection is enabled.
+                Otherwise, it is disabled.
+        """
+        self._dynamic_foreground = enable
+
+    @property
+    def dynamic_foreground(self):
+        """Returns `True` if dynamic foreground selection is enabled,
+        otherwise `False`.
+        """
+        return self._dynamic_foreground
 
     @staticmethod
     def get_instance():
@@ -656,13 +861,17 @@ class Style(ttk.Style):
         """Calls configure of superclass; used by style builder classes."""
         super().configure(style, **kw)
 
-    def _load_themes(self):
+    def _load_themes(self, EXTERNAL_THEMES=None):
         """Load all ttkbootstrap defined themes"""
         # create a theme definition object for each theme, this will be
         # used to generate the theme in tkinter along with any assets
         # at run-time
         if USER_THEMES:
             STANDARD_THEMES.update(USER_THEMES)
+
+        if EXTERNAL_THEMES:
+            STANDARD_THEMES.update(EXTERNAL_THEMES)
+
         theme_settings = {"themes": STANDARD_THEMES}
         for name, definition in theme_settings["themes"].items():
             self.register_theme(
@@ -696,6 +905,10 @@ class Style(ttk.Style):
                 builder: StyleBuilderTTK = self._get_builder()
                 method: Callable = builder.name_to_method(method_name)
                 method(builder, color)
+
+    def load_user_theme(self, theme: ThemeDefinition):
+        """Load a user theme definition"""
+        self.register_theme(theme)
 
     def load_user_themes(self, file):
         """Load user themes saved in json format"""
@@ -1056,7 +1269,7 @@ class StyleBuilderTK:
             relief=tk.FLAT,
             padx=5,
             pady=5,
-            #font="TkDefaultFont",
+            # font="TkDefaultFont",
         )
 
 
@@ -1069,11 +1282,13 @@ class StyleBuilderTTK:
     user.
     """
 
-    def __init__(self):
+    def __init__(self, build: bool = True):
         self.style: Style = Style.get_instance()
         self.theme_images = {}
         self.builder_tk = StyleBuilderTK()
-        self.create_theme()
+
+        if build:
+            self.create_theme()
 
     @staticmethod
     def name_to_method(method_name):
@@ -1171,6 +1386,19 @@ class StyleBuilderTTK:
         self.create_link_button_style()
         self.style.configure("symbol.Link.TButton", font="-size 16")
 
+        # this is the general style applied to the tooltip
+        self.create_label_style()
+        self.style.configure(
+            style="tooltip.TLabel",
+            background="#fffddd",
+            foreground="#333",
+            bordercolor="#888",
+            borderwidth=1,
+            darkcolor="#fffddd",
+            lightcolor="#fffddd",
+            relief=RAISED,
+        )
+
     def create_combobox_style(self, colorname=DEFAULT):
         """Create a style for the ttk.Combobox widget.
 
@@ -1192,14 +1420,32 @@ class StyleBuilderTTK:
 
         if any([colorname == DEFAULT, colorname == ""]):
             ttkstyle = STYLE
-            element = f"{ttkstyle.replace('TC','C')}"
+            element = f"{ttkstyle.replace('TC', 'C')}"
             focuscolor = self.colors.primary
         else:
             ttkstyle = f"{colorname}.{STYLE}"
-            element = f"{ttkstyle.replace('TC','C')}"
+            element = f"{ttkstyle.replace('TC', 'C')}"
             focuscolor = self.colors.get(colorname)
 
-        self.style.element_create(f"{element}.downarrow", "from", TTK_DEFAULT)
+        # Create custom arrow assets since the default ones don't work with Tcl/Tk bundled in python 3.13
+        arrow_images = self.create_simple_arrow_assets(
+            self.colors.inputfg,
+            disabled_fg,
+            focuscolor,
+        )
+        downarrow_image = arrow_images[0][1]
+        downarrow_disabled_image = arrow_images[1][1]
+        downarrow_focused_image = arrow_images[2][1]
+        self.style.element_create(
+            f"{element}.downarrow",
+            "image",
+            downarrow_image,
+            ("disabled", downarrow_disabled_image),
+            ("pressed !disabled", downarrow_focused_image),
+            ("focus !disabled", downarrow_focused_image),
+            ("hover !disabled", downarrow_focused_image),
+        )
+        #  self.style.element_create(f"{element}.downarrow", "from", TTK_DEFAULT)  # doesn't work in python 3.13
         self.style.element_create(f"{element}.padding", "from", TTK_CLAM)
         self.style.element_create(f"{element}.textarea", "from", TTK_CLAM)
 
@@ -1211,14 +1457,12 @@ class StyleBuilderTTK:
             bordercolor=bordercolor,
             darkcolor=self.colors.inputbg,
             lightcolor=self.colors.inputbg,
-            arrowcolor=self.colors.inputfg,
             foreground=self.colors.inputfg,
             fieldbackground=self.colors.inputbg,
             background=self.colors.inputbg,
             insertcolor=self.colors.inputfg,
             relief=tk.FLAT,
             padding=5,
-            arrowsize=self.scale_size(12),
         )
         self.style.map(
             ttkstyle,
@@ -1242,12 +1486,6 @@ class StyleBuilderTTK:
                 ("pressed !disabled", focuscolor),
                 ("readonly", readonly),
             ],
-            arrowcolor=[
-                ("disabled", disabled_fg),
-                ("pressed !disabled", focuscolor),
-                ("focus !disabled", focuscolor),
-                ("hover !disabled", focuscolor),
-            ],
         )
         self.style.layout(
             ttkstyle,
@@ -1260,7 +1498,7 @@ class StyleBuilderTTK:
                         "children": [
                             (
                                 "Combobox.downarrow",
-                                {"side": tk.RIGHT, "sticky": tk.NS},
+                                {"side": tk.RIGHT, "sticky": tk.S},
                             ),
                             (
                                 "Combobox.padding",
@@ -1281,6 +1519,11 @@ class StyleBuilderTTK:
             ],
         )
         self.style._register_ttkstyle(ttkstyle)
+        try:
+            self.create_scrollbar_style()
+        except Exception:
+            # style already created
+            pass
 
     def create_separator_style(self, colorname=DEFAULT):
         """Create a style for the ttk.Separator widget.
@@ -1345,7 +1588,7 @@ class StyleBuilderTTK:
 
         Returns:
 
-            Tuple[str]:
+            tuple[str]:
                 A list of photoimage names.
         """
         if any([colorname == DEFAULT, colorname == ""]):
@@ -1373,7 +1616,7 @@ class StyleBuilderTTK:
         )
         draw.polygon(xy=[(0, 52), (48, 100), (0, 100)], fill=barcolor)
 
-        _resized = img.resize((thickness, thickness), Image.LANCZOS)
+        _resized = img.resize((thickness, thickness), Resampling.LANCZOS)
         h_img = ImageTk.PhotoImage(_resized)
         h_name = h_img._PhotoImage__photo.name
         v_img = ImageTk.PhotoImage(_resized.rotate(90))
@@ -1609,7 +1852,7 @@ class StyleBuilderTTK:
 
         Returns:
 
-            Tuple[str]:
+            tuple[str]:
                 A tuple of PhotoImage names to be used in the image
                 layout when building the style.
         """
@@ -1637,7 +1880,7 @@ class StyleBuilderTTK:
         draw = ImageDraw.Draw(_normal)
         draw.ellipse((0, 0, 95, 95), fill=normal_color)
         normal_img = ImageTk.PhotoImage(
-            _normal.resize((size, size), Image.LANCZOS)
+            _normal.resize((size, size), Resampling.LANCZOS)
         )
         normal_name = util.get_image_name(normal_img)
         self.theme_images[normal_name] = normal_img
@@ -1647,7 +1890,7 @@ class StyleBuilderTTK:
         draw = ImageDraw.Draw(_pressed)
         draw.ellipse((0, 0, 95, 95), fill=pressed_color)
         pressed_img = ImageTk.PhotoImage(
-            _pressed.resize((size, size), Image.LANCZOS)
+            _pressed.resize((size, size), Resampling.LANCZOS)
         )
         pressed_name = util.get_image_name(pressed_img)
         self.theme_images[pressed_name] = pressed_img
@@ -1657,7 +1900,7 @@ class StyleBuilderTTK:
         draw = ImageDraw.Draw(_hover)
         draw.ellipse((0, 0, 95, 95), fill=hover_color)
         hover_img = ImageTk.PhotoImage(
-            _hover.resize((size, size), Image.LANCZOS)
+            _hover.resize((size, size), Resampling.LANCZOS)
         )
         hover_name = util.get_image_name(hover_img)
         self.theme_images[hover_name] = hover_img
@@ -1667,7 +1910,7 @@ class StyleBuilderTTK:
         draw = ImageDraw.Draw(_disabled)
         draw.ellipse((0, 0, 95, 95), fill=disabled_color)
         disabled_img = ImageTk.PhotoImage(
-            _disabled.resize((size, size), Image.LANCZOS)
+            _disabled.resize((size, size), Resampling.LANCZOS)
         )
         disabled_name = util.get_image_name(disabled_img)
         self.theme_images[disabled_name] = disabled_img
@@ -1879,6 +2122,56 @@ class StyleBuilderTTK:
         self.style._register_ttkstyle(h_ttkstyle)
         self.style._register_ttkstyle(v_ttkstyle)
 
+    def create_simple_arrow_assets(self, arrowcolor: str, disabledcolor: str, activecolor: str, y_offset: int = 0):
+        """
+        Create simple arrow assets (small triangles) that can be used for various widgets.
+        Originally created to replace Combobox.downarrow to fix layout issues in python 3.13.
+        Also used for the Spinbox widget.
+
+        Args:
+            arrowcolor: The color value to use as the arrow fill color.
+            disabledcolor: A second color value to use when the arrow is disabled.
+            activecolor: A third color value to use when the arrow has focus.
+            y_offset: (optional) The vertical padding to apply to the arrow images (useful in spinnboxes).
+        Returns:
+            A nested tuple containing the names of the created arrow images in the order (up, down, left, right)
+            for each color.
+        """
+
+        def draw_simple_arrow(color: str, y_offset: int = 0):
+            img = Image.new("RGBA", (13, 11))
+            draw = ImageDraw.Draw(img)
+            size = self.scale_size([13, 11])
+
+            # Draw the arrow shape (triangle) pointing upwards, offset by the specified y_offset
+            draw.polygon([(3, 6 + y_offset), (9, 6 + y_offset), (6, 3 + y_offset)], fill=color)
+
+            img = img.resize(size, Resampling.BICUBIC)
+
+            up_img = ImageTk.PhotoImage(img)
+            up_name = util.get_image_name(up_img)
+            self.theme_images[up_name] = up_img
+
+            down_img = ImageTk.PhotoImage(img.rotate(180))
+            down_name = util.get_image_name(down_img)
+            self.theme_images[down_name] = down_img
+
+            left_img = ImageTk.PhotoImage(img.rotate(90))
+            left_name = util.get_image_name(left_img)
+            self.theme_images[left_name] = left_img
+
+            right_img = ImageTk.PhotoImage(img.rotate(-90))
+            right_name = util.get_image_name(right_img)
+            self.theme_images[right_name] = right_img
+
+            return up_name, down_name, left_name, right_name
+
+        normal_names = draw_simple_arrow(arrowcolor, y_offset=y_offset)
+        pressed_names = draw_simple_arrow(disabledcolor, y_offset=y_offset)
+        active_names = draw_simple_arrow(activecolor, y_offset=y_offset)
+
+        return normal_names, pressed_names, active_names
+
     def create_arrow_assets(self, arrowcolor, pressed, active):
         """Create arrow assets used for various widget buttons.
 
@@ -1899,7 +2192,6 @@ class StyleBuilderTTK:
         """
 
         def draw_arrow(color: str):
-
             img = Image.new("RGBA", (11, 11))
             draw = ImageDraw.Draw(img)
             size = self.scale_size([11, 11])
@@ -1912,7 +2204,7 @@ class StyleBuilderTTK:
             draw.line([7, 5, 7, 8], fill=color)
             draw.line([8, 6, 8, 9], fill=color)
 
-            img = img.resize(size, Image.BICUBIC)
+            img = img.resize(size, Resampling.BICUBIC)
 
             up_img = ImageTk.PhotoImage(img)
             up_name = util.get_image_name(up_img)
@@ -1964,7 +2256,7 @@ class StyleBuilderTTK:
             draw = ImageDraw.Draw(img)
             radius = min([x, y]) // 2
             draw.rounded_rectangle([0, 0, x - 1, y - 1], radius, fill)
-            image = ImageTk.PhotoImage(img.resize(size, Image.BICUBIC))
+            image = ImageTk.PhotoImage(img.resize(size, Resampling.BICUBIC))
             name = util.get_image_name(image)
             self.theme_images[name] = image
             return name
@@ -2158,7 +2450,7 @@ class StyleBuilderTTK:
             x = size[0] * 10
             y = size[1] * 10
             img = Image.new("RGBA", (x, y), fill)
-            image = ImageTk.PhotoImage(img.resize(size), Image.BICUBIC)
+            image = ImageTk.PhotoImage(img.resize(size), Resampling.BICUBIC)
             name = util.get_image_name(image)
             self.theme_images[name] = image
             return name
@@ -2363,8 +2655,32 @@ class StyleBuilderTTK:
             arrowfocus = focuscolor
 
         element = ttkstyle.replace(".TS", ".S")
-        self.style.element_create(f"{element}.uparrow", "from", TTK_DEFAULT)
-        self.style.element_create(f"{element}.downarrow", "from", TTK_DEFAULT)
+        arrow_images = self.create_simple_arrow_assets(
+            self.colors.inputfg, disabled_fg, arrowfocus, y_offset=2
+        )
+        uparrow_image = arrow_images[0][0]
+        uparrow_disabled_image = arrow_images[1][0]
+        uparrow_focus_image = arrow_images[2][0]
+        downarrow_image = arrow_images[0][1]
+        downarrow_disabled_image = arrow_images[1][1]
+        downarrow_focus_image = arrow_images[2][1]
+
+        self.style.element_create(
+            f"{element}.uparrow",
+            "image",
+            uparrow_image,
+            ("disabled", uparrow_disabled_image),
+            ("pressed !disabled", uparrow_focus_image),
+            ("hover !disabled", uparrow_focus_image),
+        )
+        self.style.element_create(
+            f"{element}.downarrow",
+            "image",
+            downarrow_image,
+            ("disabled", downarrow_disabled_image),
+            ("pressed !disabled", downarrow_focus_image),
+            ("hover !disabled", downarrow_focus_image),
+        )
         self.style.layout(
             ttkstyle,
             [
@@ -2421,9 +2737,7 @@ class StyleBuilderTTK:
             borderwidth=0,
             background=self.colors.inputbg,
             relief=tk.FLAT,
-            arrowcolor=self.colors.inputfg,
             insertcolor=self.colors.inputfg,
-            arrowsize=self.scale_size(12),
             padding=(10, 5),
         )
         self.style.map(
@@ -2445,11 +2759,6 @@ class StyleBuilderTTK:
                 ("invalid", self.colors.danger),
                 ("focus !disabled", focuscolor),
                 ("hover !disabled", focuscolor),
-            ],
-            arrowcolor=[
-                ("disabled !disabled", disabled_fg),
-                ("pressed !disabled", arrowfocus),
-                ("hover !disabled", arrowfocus),
             ],
         )
         # register ttkstyles
@@ -2494,7 +2803,6 @@ class StyleBuilderTTK:
             body_style = f"{colorname}.{STYLE}"
             header_style = f"{colorname}.{STYLE}.Heading"
             hover = Colors.update_hsv(background, vd=0.1)
-
 
         # treeview header
         self.style._build_configure(
@@ -2735,7 +3043,7 @@ class StyleBuilderTTK:
         disabled_bg = Colors.make_transparent(0.10, self.colors.fg, self.colors.bg)
         disabled_fg = Colors.make_transparent(0.30, self.colors.fg, self.colors.bg)
         pressed = Colors.make_transparent(0.80, background, self.colors.bg)
-        hover = Colors.make_transparent(0.90, background, self.colors.bg)        
+        hover = Colors.make_transparent(0.90, background, self.colors.bg)
 
         self.style._build_configure(
             ttkstyle,
@@ -2745,7 +3053,7 @@ class StyleBuilderTTK:
             darkcolor=background,
             lightcolor=background,
             relief=tk.RAISED,
-            focusthickness=0,
+            focusthickness=1,
             focuscolor=foreground,
             padding=(10, 5),
             anchor=tk.CENTER,
@@ -2753,6 +3061,7 @@ class StyleBuilderTTK:
         self.style.map(
             ttkstyle,
             foreground=[("disabled", disabled_fg)],
+            focuscolor=[("disabled", disabled_fg)],
             background=[
                 ("disabled", disabled_bg),
                 ("pressed !disabled", pressed),
@@ -2806,7 +3115,7 @@ class StyleBuilderTTK:
             darkcolor=self.colors.bg,
             lightcolor=self.colors.bg,
             relief=tk.RAISED,
-            focusthickness=0,
+            focusthickness=1,
             focuscolor=foreground,
             padding=(10, 5),
             anchor=tk.CENTER,
@@ -2866,7 +3175,7 @@ class StyleBuilderTTK:
             foreground = self.colors.get(colorname)
             ttkstyle = f"{colorname}.{STYLE}"
 
-        disabled_fg = Colors.make_transparent(0.30, self.colors.fg, self.colors.bg)  
+        disabled_fg = Colors.make_transparent(0.30, self.colors.fg, self.colors.bg)
 
         self.style._build_configure(
             ttkstyle,
@@ -2876,7 +3185,7 @@ class StyleBuilderTTK:
             darkcolor=self.colors.bg,
             lightcolor=self.colors.bg,
             relief=tk.RAISED,
-            focusthickness=0,
+            focusthickness=1,
             focuscolor=foreground,
             anchor=tk.CENTER,
             padding=(10, 5),
@@ -2928,7 +3237,7 @@ class StyleBuilderTTK:
 
         Returns:
 
-            Tuple[str]:
+            tuple[str]:
                 A tuple of PhotoImage names.
         """
         size = self.scale_size([24, 15])
@@ -2941,9 +3250,9 @@ class StyleBuilderTTK:
         on_indicator = self.colors.selectfg
         on_fill = prime_color
         off_fill = self.colors.bg
-        disabled_fg = Colors.make_transparent(0.3, self.colors.fg, self.colors.bg)  
+        disabled_fg = Colors.make_transparent(0.3, self.colors.fg, self.colors.bg)
         off_border = Colors.make_transparent(0.4, self.colors.fg, self.colors.bg)
-        off_indicator = Colors.make_transparent(0.4, self.colors.fg, self.colors.bg)     
+        off_indicator = Colors.make_transparent(0.4, self.colors.fg, self.colors.bg)
 
         # override defaults for light and dark colors
         if colorname == LIGHT:
@@ -2961,7 +3270,7 @@ class StyleBuilderTTK:
         )
         draw.rectangle([18, 18, 110, 110], fill=off_indicator)
 
-        off_img = ImageTk.PhotoImage(_off.resize(size, Image.LANCZOS))
+        off_img = ImageTk.PhotoImage(_off.resize(size, Resampling.LANCZOS))
         off_name = util.get_image_name(off_img)
         self.theme_images[off_name] = off_img
 
@@ -2972,8 +3281,8 @@ class StyleBuilderTTK:
             xy=[1, 1, 225, 129], outline=on_border, width=6, fill=on_fill
         )
         draw.rectangle([18, 18, 110, 110], fill=on_indicator)
-        _on = toggle_on.transpose(Image.ROTATE_180)
-        on_img = ImageTk.PhotoImage(_on.resize(size, Image.LANCZOS))
+        _on = toggle_on.transpose(Transpose.ROTATE_180)
+        on_img = ImageTk.PhotoImage(_on.resize(size, Resampling.LANCZOS))
         on_name = util.get_image_name(on_img)
         self.theme_images[on_name] = on_img
 
@@ -2983,7 +3292,7 @@ class StyleBuilderTTK:
         draw.rectangle([1, 1, 225, 129], outline=disabled_fg, width=6)
         draw.rectangle([18, 18, 110, 110], fill=disabled_fg)
         disabled_img = ImageTk.PhotoImage(
-            _disabled.resize(size, Image.LANCZOS)
+            _disabled.resize(size, Resampling.LANCZOS)
         )
         disabled_name = util.get_image_name(disabled_img)
         self.theme_images[disabled_name] = disabled_img
@@ -2995,11 +3304,10 @@ class StyleBuilderTTK:
             xy=[1, 1, 225, 129], outline=disabled_fg, width=6, fill=off_fill
         )
         draw.rectangle([18, 18, 110, 110], fill=disabled_fg)
-        _on_disabled = toggle_on_disabled.transpose(Image.ROTATE_180)
-        on_dis_img = ImageTk.PhotoImage(_on_disabled.resize(size, Image.LANCZOS))
+        _on_disabled = toggle_on_disabled.transpose(Transpose.ROTATE_180)
+        on_dis_img = ImageTk.PhotoImage(_on_disabled.resize(size, Resampling.LANCZOS))
         on_disabled_name = util.get_image_name(on_dis_img)
         self.theme_images[on_disabled_name] = on_dis_img
-
 
         return off_name, on_name, disabled_name, on_disabled_name
 
@@ -3022,7 +3330,7 @@ class StyleBuilderTTK:
 
         Returns:
 
-            Tuple[str]:
+            tuple[str]:
                 A tuple of PhotoImage names.
         """
         size = self.scale_size([24, 15])
@@ -3037,9 +3345,9 @@ class StyleBuilderTTK:
         on_fill = prime_color
         off_fill = self.colors.bg
 
-        disabled_fg = Colors.make_transparent(0.3, self.colors.fg, self.colors.bg)  
+        disabled_fg = Colors.make_transparent(0.3, self.colors.fg, self.colors.bg)
         off_border = Colors.make_transparent(0.4, self.colors.fg, self.colors.bg)
-        off_indicator = Colors.make_transparent(0.4, self.colors.fg, self.colors.bg)  
+        off_indicator = Colors.make_transparent(0.4, self.colors.fg, self.colors.bg)
 
         # override defaults for light and dark colors
         if colorname == LIGHT:
@@ -3060,7 +3368,7 @@ class StyleBuilderTTK:
             fill=off_fill,
         )
         draw.ellipse([20, 18, 112, 110], fill=off_indicator)
-        off_img = ImageTk.PhotoImage(_off.resize(size, Image.LANCZOS))
+        off_img = ImageTk.PhotoImage(_off.resize(size, Resampling.LANCZOS))
         off_name = util.get_image_name(off_img)
         self.theme_images[off_name] = off_img
 
@@ -3075,8 +3383,8 @@ class StyleBuilderTTK:
             fill=on_fill,
         )
         draw.ellipse([20, 18, 112, 110], fill=on_indicator)
-        _on = _on.transpose(Image.ROTATE_180)
-        on_img = ImageTk.PhotoImage(_on.resize(size, Image.LANCZOS))
+        _on = _on.transpose(Transpose.ROTATE_180)
+        on_img = ImageTk.PhotoImage(_on.resize(size, Resampling.LANCZOS))
         on_name = util.get_image_name(on_img)
         self.theme_images[on_name] = on_img
 
@@ -3091,10 +3399,10 @@ class StyleBuilderTTK:
             fill=off_fill,
         )
         draw.ellipse([20, 18, 112, 110], fill=disabled_fg)
-        _on_disabled = _on_disabled.transpose(Image.ROTATE_180)
-        on_dis_img = ImageTk.PhotoImage(_on_disabled.resize(size, Image.LANCZOS))
+        _on_disabled = _on_disabled.transpose(Transpose.ROTATE_180)
+        on_dis_img = ImageTk.PhotoImage(_on_disabled.resize(size, Resampling.LANCZOS))
         on_disabled_name = util.get_image_name(on_dis_img)
-        self.theme_images[on_disabled_name] = on_dis_img        
+        self.theme_images[on_disabled_name] = on_dis_img
 
         # toggle disabled
         _disabled = Image.new("RGBA", (226, 130))
@@ -3104,7 +3412,7 @@ class StyleBuilderTTK:
         )
         draw.ellipse([20, 18, 112, 110], fill=disabled_fg)
         disabled_img = ImageTk.PhotoImage(
-            _disabled.resize(size, Image.LANCZOS)
+            _disabled.resize(size, Resampling.LANCZOS)
         )
         disabled_name = util.get_image_name(disabled_img)
         self.theme_images[disabled_name] = disabled_img
@@ -3121,7 +3429,7 @@ class StyleBuilderTTK:
         """
         STYLE = "Round.Toggle"
 
-        disabled_fg = Colors.make_transparent(0.30, self.colors.fg, self.colors.bg)  
+        disabled_fg = Colors.make_transparent(0.30, self.colors.fg, self.colors.bg)
 
         if any([colorname == DEFAULT, colorname == ""]):
             ttkstyle = STYLE
@@ -3209,7 +3517,7 @@ class StyleBuilderTTK:
 
         STYLE = "Square.Toggle"
 
-        disabled_fg = Colors.make_transparent(0.30, self.colors.fg, self.colors.bg)  
+        disabled_fg = Colors.make_transparent(0.30, self.colors.fg, self.colors.bg)
 
         if any([colorname == DEFAULT, colorname == ""]):
             ttkstyle = STYLE
@@ -3312,14 +3620,19 @@ class StyleBuilderTTK:
             darkcolor=toggle_off,
             lightcolor=toggle_off,
             relief=tk.RAISED,
-            focusthickness=0,
-            focuscolor="",
+            focusthickness=1,
+            focuscolor=foreground,
             padding=(10, 5),
             anchor=tk.CENTER,
         )
         self.style.map(
             ttkstyle,
             foreground=[
+                ("disabled", disabled_fg),
+                ("hover", foreground),
+                ("selected", foreground),
+            ],
+            focuscolor=[
                 ("disabled", disabled_fg),
                 ("hover", foreground),
                 ("selected", foreground),
@@ -3363,7 +3676,7 @@ class StyleBuilderTTK:
         """
         STYLE = "Outline.Toolbutton"
 
-        disabled_fg = Colors.make_transparent(0.30, self.colors.fg, self.colors.bg)   
+        disabled_fg = Colors.make_transparent(0.30, self.colors.fg, self.colors.bg)
 
         if any([colorname == DEFAULT, colorname == ""]):
             ttkstyle = STYLE
@@ -3501,7 +3814,7 @@ class StyleBuilderTTK:
 
         Returns:
 
-            Tuple[str]:
+            tuple[str]:
                 A tuple of PhotoImage names
         """
         prime_color = self.colors.get(colorname)
@@ -3522,7 +3835,7 @@ class StyleBuilderTTK:
         draw.ellipse(
             xy=[1, 1, 133, 133], outline=off_border, width=6, fill=off_fill
         )
-        off_img = ImageTk.PhotoImage(_off.resize(size, Image.LANCZOS))
+        off_img = ImageTk.PhotoImage(_off.resize(size, Resampling.LANCZOS))
         off_name = util.get_image_name(off_img)
         self.theme_images[off_name] = off_img
 
@@ -3534,7 +3847,7 @@ class StyleBuilderTTK:
         else:
             draw.ellipse(xy=[1, 1, 133, 133], fill=on_fill)
         draw.ellipse([40, 40, 94, 94], fill=on_indicator)
-        on_img = ImageTk.PhotoImage(_on.resize(size, Image.LANCZOS))
+        on_img = ImageTk.PhotoImage(_on.resize(size, Resampling.LANCZOS))
         on_name = util.get_image_name(on_img)
         self.theme_images[on_name] = on_img
 
@@ -3546,9 +3859,9 @@ class StyleBuilderTTK:
         else:
             draw.ellipse(xy=[1, 1, 133, 133], fill=disabled)
         draw.ellipse([40, 40, 94, 94], fill=off_fill)
-        on_dis_img = ImageTk.PhotoImage(_on_dis.resize(size, Image.LANCZOS))
+        on_dis_img = ImageTk.PhotoImage(_on_dis.resize(size, Resampling.LANCZOS))
         on_disabled_name = util.get_image_name(on_dis_img)
-        self.theme_images[on_disabled_name] = on_dis_img        
+        self.theme_images[on_disabled_name] = on_dis_img
 
         # radio disabled
         _disabled = Image.new("RGBA", (134, 134))
@@ -3557,7 +3870,7 @@ class StyleBuilderTTK:
             xy=[1, 1, 133, 133], outline=disabled, width=3, fill=off_fill
         )
         disabled_img = ImageTk.PhotoImage(
-            _disabled.resize(size, Image.LANCZOS)
+            _disabled.resize(size, Resampling.LANCZOS)
         )
         disabled_name = util.get_image_name(disabled_img)
         self.theme_images[disabled_name] = disabled_img
@@ -3679,7 +3992,7 @@ class StyleBuilderTTK:
             draw.rectangle(xy=xy, fill=fill)
 
         size = self.scale_size([21, 22])
-        tk_img = ImageTk.PhotoImage(image.resize(size, Image.LANCZOS))
+        tk_img = ImageTk.PhotoImage(image.resize(size, Resampling.LANCZOS))
         tk_name = util.get_image_name(tk_img)
         self.theme_images[tk_name] = tk_img
         return tk_name
@@ -3699,18 +4012,18 @@ class StyleBuilderTTK:
         else:
             disabled_fg = self.colors.selectbg
 
-        btn_foreground = Colors.get_foreground(self.colors, colorname)
-
-        img_normal = self.create_date_button_assets(btn_foreground)
-
         if any([colorname == DEFAULT, colorname == ""]):
             ttkstyle = STYLE
             foreground = self.colors.get_foreground(PRIMARY)
             background = self.colors.primary
+            btn_foreground = Colors.get_foreground(self.colors, PRIMARY)
         else:
             ttkstyle = f"{colorname}.{STYLE}"
             foreground = self.colors.get_foreground(colorname)
             background = self.colors.get(colorname)
+            btn_foreground = Colors.get_foreground(self.colors, colorname)
+
+        img_normal = self.create_date_button_assets(btn_foreground)
 
         pressed = Colors.update_hsv(background, vd=-0.1)
         hover = Colors.update_hsv(background, vd=0.10)
@@ -3788,8 +4101,8 @@ class StyleBuilderTTK:
             darkcolor=self.colors.bg,
             lightcolor=self.colors.bg,
             relief=tk.RAISED,
-            focusthickness=0,
-            focuscolor="",
+            focusthickness=1,
+            focuscolor=self.colors.fg,
             borderwidth=1,
             padding=(10, 5),
             anchor=tk.CENTER,
@@ -3803,13 +4116,18 @@ class StyleBuilderTTK:
                         "sticky": tk.NSEW,
                         "children": [
                             (
-                                "Toolbutton.padding",
+                                "Toolbutton.focus",
                                 {
                                     "sticky": tk.NSEW,
                                     "children": [
                                         (
-                                            "Toolbutton.label",
-                                            {"sticky": tk.NSEW},
+                                            "Toolbutton.padding",
+                                            {
+                                                "sticky": tk.NSEW,
+                                                "children": [
+                                                    ("Toolbutton.label", {"sticky": tk.NSEW})
+                                                ],
+                                            },
                                         )
                                     ],
                                 },
@@ -3819,6 +4137,7 @@ class StyleBuilderTTK:
                 )
             ],
         )
+
         self.style.map(
             ttkstyle,
             foreground=[
@@ -3848,10 +4167,14 @@ class StyleBuilderTTK:
                 ("selected !disabled", pressed),
                 ("hover !disabled", pressed),
             ],
+            focuscolor=[
+                ("disabled", disabled_fg),
+                ("pressed !disabled", self.colors.selectfg),
+                ("selected !disabled", self.colors.selectfg),
+                ("hover !disabled", self.colors.selectfg),
+            ]
         )
-        self.style._build_configure(
-            chevron_style, font="-size 14", focuscolor=""
-        )
+        self.style._build_configure(chevron_style, font="-size 14")
 
         # register ttkstyle
         self.style._register_ttkstyle(ttkstyle)
@@ -4110,7 +4433,7 @@ class StyleBuilderTTK:
 
         Returns:
 
-            Tuple[str]:
+            tuple[str]:
                 A tuple of PhotoImage names.
         """
         # set platform specific checkfont
@@ -4140,7 +4463,7 @@ class StyleBuilderTTK:
                     # will prevent the program from crashing. I need 
                     # a better solution for a missing font
                     fnt = ImageFont.load_default()
-                    font_offset = 0        
+                    font_offset = 0
                     indicator = "x"
         else:
             # Mac OS font
@@ -4153,7 +4476,7 @@ class StyleBuilderTTK:
         off_fill = self.colors.bg
         off_border = self.colors.selectbg
         off_border = Colors.make_transparent(0.4, self.colors.fg, self.colors.bg)
-        disabled_fg = Colors.make_transparent(0.3, self.colors.fg, self.colors.bg)        
+        disabled_fg = Colors.make_transparent(0.3, self.colors.fg, self.colors.bg)
 
         if colorname == LIGHT:
             check_color = self.colors.dark
@@ -4177,7 +4500,7 @@ class StyleBuilderTTK:
             fill=off_fill,
         )
         off_img = ImageTk.PhotoImage(
-            checkbutton_off.resize(size, Image.LANCZOS)
+            checkbutton_off.resize(size, Resampling.LANCZOS)
         )
         off_name = util.get_image_name(off_img)
         self.theme_images[off_name] = off_img
@@ -4194,11 +4517,11 @@ class StyleBuilderTTK:
         )
 
         draw.text((20, font_offset), indicator, font=fnt, fill=check_color)
-        on_img = ImageTk.PhotoImage(checkbutton_on.resize(size, Image.LANCZOS))
+        on_img = ImageTk.PhotoImage(checkbutton_on.resize(size, Resampling.LANCZOS))
         on_name = util.get_image_name(on_img)
         self.theme_images[on_name] = on_img
 
-       # checkbutton on/disabled
+        # checkbutton on/disabled
         checkbutton_on_disabled = Image.new("RGBA", (134, 134))
         draw = ImageDraw.Draw(checkbutton_on_disabled)
         draw.rounded_rectangle(
@@ -4210,7 +4533,7 @@ class StyleBuilderTTK:
         )
 
         draw.text((20, font_offset), indicator, font=fnt, fill=off_fill)
-        on_dis_img = ImageTk.PhotoImage(checkbutton_on_disabled.resize(size, Image.LANCZOS))
+        on_dis_img = ImageTk.PhotoImage(checkbutton_on_disabled.resize(size, Resampling.LANCZOS))
         on_dis_name = util.get_image_name(on_dis_img)
         self.theme_images[on_dis_name] = on_dis_img
 
@@ -4223,10 +4546,10 @@ class StyleBuilderTTK:
             fill=on_fill,
             outline=on_border,
             width=3,
-        )        
+        )
         draw.line([36, 67, 100, 67], fill=check_color, width=12)
         alt_img = ImageTk.PhotoImage(
-            checkbutton_alt.resize(size, Image.LANCZOS)
+            checkbutton_alt.resize(size, Resampling.LANCZOS)
         )
         alt_name = util.get_image_name(alt_img)
         self.theme_images[alt_name] = alt_img
@@ -4240,13 +4563,13 @@ class StyleBuilderTTK:
             fill=disabled_fg,
             outline=disabled_fg,
             width=3,
-        )        
+        )
         draw.line([36, 67, 100, 67], fill=off_fill, width=12)
         alt_dis_img = ImageTk.PhotoImage(
-            checkbutton_alt_disabled.resize(size, Image.LANCZOS)
+            checkbutton_alt_disabled.resize(size, Resampling.LANCZOS)
         )
         alt_dis_name = util.get_image_name(alt_dis_img)
-        self.theme_images[alt_dis_name] = alt_dis_img        
+        self.theme_images[alt_dis_name] = alt_dis_img
 
         # checkbutton disabled
         checkbutton_disabled = Image.new("RGBA", (134, 134))
@@ -4255,7 +4578,7 @@ class StyleBuilderTTK:
             [2, 2, 132, 132], radius=16, outline=disabled_fg, width=3
         )
         disabled_img = ImageTk.PhotoImage(
-            checkbutton_disabled.resize(size, Image.LANCZOS)
+            checkbutton_disabled.resize(size, Resampling.LANCZOS)
         )
         disabled_name = util.get_image_name(disabled_img)
         self.theme_images[disabled_name] = disabled_img
@@ -4272,19 +4595,19 @@ class StyleBuilderTTK:
         """
         STYLE = "TMenubutton"
 
-        foreground = self.colors.get_foreground(colorname)
-
         if any([colorname == DEFAULT, colorname == ""]):
             ttkstyle = STYLE
             background = self.colors.primary
+            foreground = self.colors.get_foreground(PRIMARY)
         else:
             ttkstyle = f"{colorname}.{STYLE}"
             background = self.colors.get(colorname)
+            foreground = self.colors.get_foreground(colorname)
 
         disabled_bg = Colors.make_transparent(0.10, self.colors.fg, self.colors.bg)
         disabled_fg = Colors.make_transparent(0.30, self.colors.fg, self.colors.bg)
         pressed = Colors.make_transparent(0.80, background, self.colors.bg)
-        hover = Colors.make_transparent(0.90, background, self.colors.bg)    
+        hover = Colors.make_transparent(0.90, background, self.colors.bg)
 
         self.style._build_configure(
             ttkstyle,
@@ -4510,7 +4833,6 @@ class StyleBuilderTTK:
             str:
                 The PhotoImage name.
         """
-        from math import ceil
 
         box = self.scale_size(1)
         pad = box * 2
@@ -4625,9 +4947,19 @@ class StyleBuilderTTK:
 
 
 class Keywords:
+    """Static keyword lists and regex patterns used to parse
+    ttkbootstrap "bootstyle" strings.
 
-    # TODO possibly refactor the bootstyle keyword methods into this class?
-    #   Leave for now.
+    Bootstyle strings contain space- or dash-separated tokens that may
+    specify: a widget class (e.g. "button"), an orientation ("horizontal"
+    or "vertical"), a color ("primary", "info", etc.), and optional
+    type modifiers (e.g. "outline", "link", "inverse", "striped"). The
+    constants and compiled regexes in this class centralize those token
+    definitions for reuse by the bootstyle parsing helpers.
+
+    This class is internal to the styling system and not intended to be
+    instantiated.
+    """
 
     COLORS = [
         "primary",
@@ -4692,6 +5024,21 @@ class Keywords:
 
 
 class Bootstyle:
+    """Helpers for parsing and applying ttkbootstrap "bootstyle" options.
+
+    Bootstyle augments ttk widgets with a compact styling API that lets
+    you configure color, orientation, and type with a single string (or
+    tuple) such as "primary-outline", "success", or ("danger", "inverse").
+
+    This class provides utilities to parse those tokens from strings and
+    widget state, determine the target widget class and orientation, and
+    resolve the requested color and variant. It also wires ttkbootstrap
+    into tkinter/ttk via ``setup_ttkbootstrap_api`` so that widgets accept
+    the ``bootstyle=...`` keyword at construction or during configure().
+
+    Typical end users will not call these methods directly; they are used
+    internally by the Style engine and by widget constructor overrides.
+    """
     @staticmethod
     def ttkstyle_widget_class(widget=None, string=""):
         """Find and return the widget class
@@ -5012,7 +5359,7 @@ class Bootstyle:
 
     @staticmethod
     def update_ttk_widget_style(
-        widget: ttk.Widget = None, style_string: str = None, **kwargs
+            widget: ttk.Widget = None, style_string: str = None, **kwargs
     ):
         """Update the ttk style or create if not existing.
 
@@ -5075,7 +5422,7 @@ class Bootstyle:
         return ttkstyle
 
     @staticmethod
-    def setup_ttkbootstap_api():
+    def setup_ttkbootstrap_api():
         """Setup ttkbootstrap for use with tkinter and ttk. This method
         is called when ttkbootstrap is imported to perform all of the
         necessary method overrides that implement the bootstyle api."""
@@ -5113,7 +5460,7 @@ class Bootstyle:
                     return _orig_getitem(key)
 
                 if (
-                    widget.__name__ != "OptionMenu"
+                        widget.__name__ != "OptionMenu"
                 ):  # this has it's own override
                     widget.__setitem__ = __setitem
                     widget.__getitem__ = __getitem
